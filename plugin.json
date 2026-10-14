@@ -1,0 +1,56 @@
+{
+  "manifestVersion": 2,
+  "publisher": "cpr-community",
+  "name": "gemini",
+  "displayName": "Gemini API",
+  "version": "0.1.0",
+  "description": "通过宿主 URL + Key 账号，将 OpenAI Responses 请求转换为官方或第三方 Gemini 原生协议",
+  "license": "Apache-2.0",
+  "engines": {
+    "codex-proxy-rs": ">=3.26.1, <4.0.0"
+  },
+  "main": "bin/cpr-plugin-gemini",
+  "runtime": "trustedProcess",
+  "contributes": {
+    "upstream_adapter": {
+      "version": 2,
+      "inputFormats": ["openai"],
+      "outputFormats": ["openai"]
+    }
+  },
+  "configurationSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "baseUrl": {
+        "type": "string",
+        "title": "Gemini 原生 API 基址",
+        "description": "可填写官方或第三方地址，含完整路径前缀（如 /v1beta/）；插件追加 models/{模型}:streamGenerateContent。须与 URL + Key 账号地址一致，不含密钥，生产环境使用 HTTPS",
+        "default": "https://generativelanguage.googleapis.com/v1beta/"
+      },
+      "authMode": {
+        "type": "string",
+        "title": "API Key 鉴权方式",
+        "description": "x-goog-api-key 使用 Gemini 标准头；bearer 使用 Authorization: Bearer，适用于要求此格式的第三方",
+        "enum": ["x-goog-api-key", "bearer"],
+        "default": "x-goog-api-key"
+      },
+      "models": {
+        "type": "array",
+        "title": "接管的模型 ID",
+        "description": "仅匹配这里明确列出的模型，允许第三方自定义 ID；客户端直接使用相同 ID，账号分组仅包含此上游的 Key",
+        "minItems": 1,
+        "maxItems": 64,
+        "uniqueItems": true,
+        "items": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$",
+          "maxLength": 128
+        },
+        "default": ["gemini-2.5-flash", "gemini-2.5-pro"]
+      }
+    },
+    "required": ["baseUrl", "models"]
+  },
+  "secretFields": []
+}
