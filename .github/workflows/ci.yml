@@ -1,0 +1,178 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+  workflow_call:
+    inputs:
+      require-tag:
+        description: Require a version tag before building release assets
+        type: boolean
+        default: false
+    outputs:
+      version:
+        description: Validated plugin version
+        value: ${{ jobs.check.outputs.version }}
+      archive:
+        description: Installable plugin archive filename
+        value: ${{ jobs.check.outputs.archive }}
+      prerelease:
+        description: Whether the version has a prerelease component
+        value: ${{ jobs.check.outputs.prerelease }}
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  check:
+    name: Check and package (Linux x86_64)
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+    concurrency:
+      group: ci-${{ github.workflow }}-${{ github.ref }}
+      cancel-in-progress: ${{ github.ref_type != 'tag' }}
+    outputs:
+      version: ${{ steps.metadata.outputs.version }}
+      archive: ${{ steps.metadata.outputs.archive }}
+      prerelease: ${{ steps.metadata.outputs.prerelease }}
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+
+      - name: Install the pinned Rust toolchain
+        run: |
+          rustup show active-toolchain
+          rustup component add rustfmt clippy
+          rustup target add x86_64-unknown-linux-gnu
+
+      - name: Restore Cargo cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/registry/src/
+            ~/.cargo/git/db/
+            ~/.cargo/git/checkouts/
+            target/
+          key: ubuntu-22.04-${{ runner.arch }}-cargo-${{ hashFiles('rust-toolchain.toml', 'Cargo.toml', 'Cargo.lock') }}-${{ github.sha }}
+          restore-keys: |
+            ubuntu-22.04-${{ runner.arch }}-cargo-${{ hashFiles('rust-toolchain.toml', 'Cargo.toml', 'Cargo.lock') }}-
+
+      - name: Validate versions and resolve the matching packaging CLI
+        id: metadata
+        env:
+          REQUIRE_TAG: ${{ inputs.require-tag == true }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import re
+          import subprocess
+          from pathlib import Path
+
+          metadata = json.loads(subprocess.check_output(
+              ["cargo", "metadata", "--locked", "--no-deps", "--format-version", "1"],
+              text=True,
+          ))
+          package = next(p for p in metadata["packages"] if p["name"] == "cpr-plugin-gemini")
+          manifest = json.loads(Path("plugin.json").read_text(encoding="utf-8"))
+          version = package["version"]
+          if manifest["version"] != version:
+              raise SystemExit("Cargo.toml and plugin.json must have the same version")
+          is_tag = os.environ["GITHUB_REF_TYPE"] == "tag"
+          if os.environ["REQUIRE_TAG"] == "true" and not is_tag:
+              raise SystemExit("Publishing requires an existing v<version> tag; use build-only mode for branches")
+          if is_tag and os.environ["GITHUB_REF_NAME"] != f"v{version}":
+              raise SystemExit("The tag must be v<version>, matching Cargo.toml and plugin.json")
+          sdk = next(d for d in package["dependencies"] if d["name"] == "gateway-plugin-sdk")
+          source = re.fullmatch(r"git\+(https://[^?\s]+)\?rev=([0-9a-f]{40})", sdk["source"] or "")
+          if source is None:
+              raise SystemExit("gateway-plugin-sdk must be pinned to a full Git commit over HTTPS")
+          values = {
+              "version": version,
+              "archive": f"{manifest['publisher']}.{manifest['name']}-{version}-x86_64-unknown-linux-gnu.tar.gz",
+              "prerelease": str("-" in version.split("+", 1)[0]).lower(),
+              "sdk-url": source[1],
+              "sdk-rev": source[2],
+          }
+          with Path(os.environ["GITHUB_OUTPUT"]).open("a", encoding="utf-8") as output:
+              for key, value in values.items():
+                  print(f"{key}={value}", file=output)
+          print(f"Validated Gemini plugin {version}")
+          PY
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run Clippy
+        run: cargo clippy --all-targets --all-features --locked -- -D warnings
+
+      - name: Run offline unit and SDK RPC tests
+        run: cargo test --locked
+
+      - name: Install the packaging CLI from the SDK commit
+        env:
+          SDK_URL: ${{ steps.metadata.outputs.sdk-url }}
+          SDK_REV: ${{ steps.metadata.outputs.sdk-rev }}
+        run: |
+          cargo install --locked \
+            --git "$SDK_URL" --rev "$SDK_REV" \
+            --root "$GITHUB_WORKSPACE/target/plugin-cli" \
+            --target-dir "$GITHUB_WORKSPACE/target/plugin-cli-build" \
+            codex-proxy-plugin-cli
+
+      - name: Build the installable release archive
+        env:
+          CPR_PLUGIN_CLI: ${{ github.workspace }}/target/plugin-cli/bin/cpr-plugin
+        run: |
+          bash -n scripts/package.sh
+          bash scripts/package.sh
+
+      - name: Verify checksum, Linux compatibility and packaged RPC behavior
+        env:
+          ARCHIVE: ${{ steps.metadata.outputs.archive }}
+        run: |
+          set -euo pipefail
+          (cd dist && sha256sum --check "$ARCHIVE.sha256")
+          unpack_dir="$(mktemp -d "$RUNNER_TEMP/gemini-package.XXXXXX")"
+          tar -xzf "dist/$ARCHIVE" -C "$unpack_dir"
+          binary="$unpack_dir/bin/cpr-plugin-gemini"
+          test -x "$binary"
+          glibc="$(readelf --version-info "$binary" | sed -n 's/.*Name: GLIBC_\([0-9.]*\).*/\1/p' | sort -V | tail -n 1)"
+          if [[ -z "$glibc" ]] || [[ "$(printf '%s\n' "$glibc" 2.34 | sort -V | tail -n 1)" != "2.34" ]]; then
+            printf 'Unsupported glibc requirement: %s (maximum allowed: 2.34)\n' "$glibc" >&2
+            exit 1
+          fi
+          ldd "$binary"
+          CPR_PLUGIN_TEST_BINARY="$binary" cargo test --test rpc --locked
+          {
+            printf '### Verified Linux x86_64 plugin\n\n'
+            printf -- '- Archive: `%s`\n' "$ARCHIVE"
+            printf -- '- Required glibc symbol version: `%s`\n' "$glibc"
+            printf -- '- SHA-256 verification and packaged SDK RPC tests passed.\n'
+            printf -- '- No external model API was called.\n'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload verified plugin assets
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: cpr-plugin-gemini-${{ steps.metadata.outputs.version }}-linux-x86_64
+          path: |
+            dist/${{ steps.metadata.outputs.archive }}
+            dist/${{ steps.metadata.outputs.archive }}.sha256
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14

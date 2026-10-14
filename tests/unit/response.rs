@@ -138,6 +138,110 @@ fn round_trips_signed_function_calls_without_losing_the_original_part() {
 }
 
 #[test]
+fn client_tool_search_round_trips_signatures_and_loads_callable_tools() {
+    let tools = json!([{"type":"tool_search","execution":"client","description":"Find file tools","parameters":{"type":"object","properties":{"query":{"type":"string"}}}}]);
+    let loaded = json!([{"type":"namespace","name":"files","tools":[{"type":"function","name":"read","defer_loading":true,"parameters":{"type":"object","properties":{"path":{"type":"string"}}}}]}]);
+    let arguments = json!({"query":"file reader"});
+    let part = json!({"functionCall":{"name":"cpr_tool_search","args":arguments,"id":"search-1"},"thoughtSignature":"fixture-search-signature"});
+    for stream in [true, false] {
+        let mut response = response(stream, tools.clone());
+        let mut events = response
+            .consume(
+                json!({"candidates":[{"content":{"parts":[part.clone()]},"finishReason":"STOP"}]}),
+            )
+            .unwrap();
+        events.extend(response.finish().unwrap());
+        let values = wire(&events);
+        let result = &values.last().unwrap()["response"];
+        let call = &result["output"][0];
+        assert_eq!(call["type"], "tool_search_call");
+        assert_eq!(call["execution"], "client");
+        assert_eq!(call["call_id"], "search-1");
+        assert_eq!(call["arguments"], arguments);
+        assert_eq!(call["status"], "completed");
+        assert!(call.get("name").is_none());
+        assert!(call.get("namespace").is_none());
+        assert!(call["id"].as_str().unwrap().starts_with("tsc_"));
+        assert!(values.iter().all(|event| {
+            !event["type"]
+                .as_str()
+                .unwrap()
+                .starts_with("response.function_call_arguments")
+        }));
+        assert!(events.iter().flat_map(|event| &event.facts).any(|fact| matches!(fact,
+            CanonicalEvent::ToolCallDelta { name:Some(name), arguments:args, .. }
+            if name == "tool_search" && serde_json::from_str::<Value>(args).unwrap() == arguments
+        )));
+        assert!(
+            events
+                .iter()
+                .flat_map(|event| &event.facts)
+                .any(|fact| matches!(
+                    fact,
+                    CanonicalEvent::Completed {
+                        reason: FinishReason::ToolCall,
+                        ..
+                    }
+                ))
+        );
+        if stream {
+            assert!(values.iter().any(
+                |event| event["type"] == "response.output_item.done" && event["item"] == *call
+            ));
+            for (index, event) in values.iter().enumerate() {
+                assert_eq!(event["sequence_number"], index as u64);
+            }
+        } else {
+            assert_eq!(values.len(), 1);
+        }
+        let mut history = vec![json!({"role":"user","content":"Find a file reader"})];
+        history.extend(result["output"].as_array().unwrap().clone());
+        history.push(json!({"type":"tool_search_output","call_id":"search-1","execution":"client","status":"completed","tools":loaded}));
+        let next = translate(json!({"input":history,"tools":tools}), "gemini-2.5-flash").unwrap();
+        assert_eq!(next.body["contents"][1]["parts"][0], part);
+        assert_eq!(
+            next.body["contents"][2]["parts"][0]["functionResponse"],
+            json!({"id":"search-1","name":"cpr_tool_search","response":{"tools":loaded}})
+        );
+        let alias = next.body["tools"][0]["functionDeclarations"][1]["name"].clone();
+        let mut next_response = Response::new(
+            "gemini-2.5-flash".into(),
+            stream,
+            next.tools,
+            next.response_fields,
+        );
+        next_response.consume(json!({"candidates":[{"content":{"parts":[{"functionCall":{"name":alias,"args":{"path":"example.txt"}}}]},"finishReason":"STOP"}]})).unwrap();
+        let next_values = wire(&next_response.finish().unwrap());
+        let next_call = &next_values.last().unwrap()["response"]["output"][0];
+        assert_eq!(next_call["type"], "function_call");
+        assert_eq!(next_call["name"], "read");
+        assert_eq!(next_call["namespace"], "files");
+        assert_eq!(
+            serde_json::from_str::<Value>(next_call["arguments"].as_str().unwrap()).unwrap(),
+            json!({"path":"example.txt"})
+        );
+        history
+            .iter_mut()
+            .find(|item| item["type"] == "tool_search_call")
+            .unwrap()["arguments"]["query"] = json!("changed query");
+        assert!(translate(json!({"input":history,"tools":tools}), "gemini-2.5-flash").is_err());
+    }
+}
+
+#[test]
+fn a_function_named_tool_search_is_not_returned_as_a_search_call() {
+    let tools = json!([
+        {"type":"function","name":"tool_search"},
+        {"type":"tool_search","execution":"client","description":"Find tools","parameters":{"type":"object"}}
+    ]);
+    let mut response = response(false, tools);
+    response.consume(json!({"candidates":[{"content":{"parts":[{"functionCall":{"name":"tool_search","args":{}}}]},"finishReason":"STOP"}]})).unwrap();
+    let values = wire(&response.finish().unwrap());
+    assert_eq!(values[0]["response"]["output"][0]["type"], "function_call");
+    assert_eq!(values[0]["response"]["output"][0]["name"], "tool_search");
+}
+
+#[test]
 fn round_trips_signed_text_without_joining_signed_parts() {
     let mut response = response(false, json!([]));
     let parts =

@@ -1,0 +1,64 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: Publish a GitHub Release (requires an existing v<version> tag)
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Validate and build
+    uses: ./.github/workflows/ci.yml
+    with:
+      require-tag: ${{ github.event_name == 'push' || inputs.publish == true }}
+
+  publish:
+    name: Publish verified assets
+    needs: build
+    if: github.event_name == 'push' || inputs.publish == true
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: Download verified plugin assets
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          name: cpr-plugin-gemini-${{ needs.build.outputs.version }}-linux-x86_64
+          path: dist
+          digest-mismatch: error
+
+      - name: Create the GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.ref_name }}
+          ARCHIVE: ${{ needs.build.outputs.archive }}
+          PRERELEASE: ${{ needs.build.outputs.prerelease }}
+        run: |
+          set -euo pipefail
+          (cd dist && sha256sum --check "$ARCHIVE.sha256")
+          flags=()
+          if [[ "$PRERELEASE" == "true" ]]; then
+            flags+=(--prerelease --latest=false)
+          fi
+          gh release create "$RELEASE_TAG" \
+            "dist/$ARCHIVE" "dist/$ARCHIVE.sha256" \
+            --verify-tag \
+            --title "Gemini API $RELEASE_TAG" \
+            --generate-notes \
+            --notes 'Linux x86_64 安装包，需要 glibc 2.34+ 和 libgcc_s。下载 .tar.gz 与同名 .sha256，校验后通过宿主插件管理安装。已通过离线 SDK RPC 回归；不代表真实上游验收。' \
+            "${flags[@]}"

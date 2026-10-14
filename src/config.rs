@@ -70,14 +70,10 @@ impl Config {
                 id: ADAPTER_ID.into(),
                 provider: BuiltinProvider::OpenAi,
                 base_url: self.base_url.clone(),
-                paths: self
-                    .models
-                    .iter()
-                    .map(|model| UpstreamPath {
-                        path: inference_path(model),
-                        purpose: UpstreamPathPurpose::Inference,
-                    })
-                    .collect(),
+                paths: vec![UpstreamPath {
+                    path: "models".into(),
+                    purpose: UpstreamPathPurpose::Inference,
+                }],
                 authentication_kinds: vec!["api_key".into()],
                 transport: UpstreamTransport::HttpSse,
                 protocol: "openai".into(),

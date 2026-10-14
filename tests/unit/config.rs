@@ -59,6 +59,56 @@ fn author_manifest_and_handlers_match_sdk_v2() {
 }
 
 #[test]
+fn registered_paths_satisfy_the_pinned_host_registration_contract() {
+    let registration = Config::parse(json!({})).unwrap().registration();
+    for adapter in registration.adapters {
+        assert!(!adapter.paths.is_empty());
+        assert!(adapter.paths.len() <= 16);
+        assert!(adapter.paths.iter().any(|path| path.purpose
+            == gateway_plugin_sdk::call::upstream_adapter::UpstreamPathPurpose::Inference));
+        let mut unique = std::collections::BTreeSet::new();
+        for path in adapter.paths {
+            assert!(!path.path.is_empty() && path.path.len() <= 2048);
+            assert!(path.path.is_ascii() && !path.path.starts_with('/'));
+            assert!(
+                path.path.bytes().all(|byte| byte.is_ascii_alphanumeric()
+                    || matches!(byte, b'/' | b'-' | b'_' | b'.' | b'~')),
+                "Host rejects registered path: {}",
+                path.path
+            );
+            assert!(
+                path.path
+                    .split('/')
+                    .all(|segment| !matches!(segment, "" | "." | ".."))
+            );
+            assert!(unique.insert(path.path));
+        }
+    }
+}
+
+#[test]
+fn maximum_model_count_does_not_exceed_the_host_path_budget() {
+    let models: Vec<_> = (0..64).map(|index| format!("team-flash-{index}")).collect();
+    let registration = Config::parse(json!({"models":models}))
+        .unwrap()
+        .registration();
+    assert_eq!(registration.adapters.len(), 1);
+    assert_eq!(registration.adapters[0].models, models);
+    assert!(registration.adapters[0].paths.len() <= 16);
+}
+
+#[test]
+fn inference_urls_keep_the_native_method_and_custom_prefix() {
+    let base = url::Url::parse("https://gateway.example.com/native/google/v1beta/").unwrap();
+    let path = crate::config::inference_path("team-flash");
+    assert_eq!(path, "models/team-flash:streamGenerateContent");
+    assert_eq!(
+        base.join(&path).unwrap().as_str(),
+        "https://gateway.example.com/native/google/v1beta/models/team-flash:streamGenerateContent"
+    );
+}
+
+#[test]
 fn selected_key_is_sent_only_as_google_header_and_default_bearer_is_overridden() {
     let config = Config::parse(json!({})).unwrap();
     let headers = config
@@ -112,10 +162,8 @@ fn third_party_urls_model_ids_and_bearer_auth_are_configurable() {
         Config::parse(json!({"baseUrl":base,"models":["team-flash"],"authMode":"bearer"})).unwrap();
     let registration = config.registration();
     assert_eq!(registration.adapters[0].base_url, base);
-    assert_eq!(
-        registration.adapters[0].paths[0].path,
-        "models/team-flash:streamGenerateContent"
-    );
+    assert_eq!(registration.adapters[0].paths.len(), 1);
+    assert_eq!(registration.adapters[0].paths[0].path, "models");
     let mut request = request();
     request.upstream_model = "team-flash".into();
     config.validate_request(&request).unwrap();

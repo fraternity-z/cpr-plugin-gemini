@@ -8,7 +8,10 @@ use serde_json::{Map, Value, json};
 use crate::{
     error::{Error, Result},
     replay::Replay,
-    tools::{self, Tools, optional_namespace, string},
+    tools::{
+        self, TOOL_SEARCH_ALIAS, ToolKind, Tools, optional_namespace, require_client_tool_search,
+        string,
+    },
 };
 
 pub(crate) struct PreparedRequest {
@@ -21,22 +24,18 @@ pub(crate) struct PreparedRequest {
 struct Call {
     name: String,
     id: Option<String>,
-    custom: bool,
+    kind: ToolKind,
     answered: bool,
 }
 
-pub(crate) fn translate(input: Value, model: &str) -> Result<PreparedRequest> {
+pub(crate) fn translate(mut input: Value, model: &str) -> Result<PreparedRequest> {
     let object = input
-        .as_object()
+        .as_object_mut()
         .ok_or_else(|| Error::invalid("Responses request must be a JSON object"))?;
+    let omitted_web_search = omit_optional_web_search(object)?;
     validate_options(object)?;
     let stream = boolean(object, "stream", false)?;
-    let tools = Tools::parse(object.get("tools"))?;
-    if !tools.is_empty() && !boolean(object, "parallel_tool_calls", true)? {
-        return Err(Error::unsupported(
-            "Gemini cannot guarantee parallel_tool_calls=false",
-        ));
-    }
+    let mut tools = Tools::parse(object.get("tools"))?;
     let items = match object.get("input") {
         Some(Value::String(text)) if !text.is_empty() => {
             vec![json!({"role":"user", "content":text})]
@@ -54,7 +53,7 @@ pub(crate) fn translate(input: Value, model: &str) -> Result<PreparedRequest> {
             .filter(|item| {
                 matches!(
                     item["type"].as_str(),
-                    Some("function_call" | "custom_tool_call")
+                    Some("function_call" | "custom_tool_call" | "tool_search_call")
                 )
             })
             .filter_map(|item| item["call_id"].as_str()),
@@ -120,6 +119,12 @@ pub(crate) fn translate(input: Value, model: &str) -> Result<PreparedRequest> {
                     _ => return Err(Error::unsupported("Unsupported message role")),
                 }
             }
+            "additional_tools" => {
+                if item["role"] != "developer" {
+                    return Err(Error::invalid("additional_tools requires role=developer"));
+                }
+                tools.load(&item["tools"])?;
+            }
             "reasoning" => {
                 if let Some(saved) = item
                     .get("id")
@@ -135,25 +140,35 @@ pub(crate) fn translate(input: Value, model: &str) -> Result<PreparedRequest> {
                     append(&mut contents, "model", saved.to_vec());
                 }
             }
-            "function_call" | "custom_tool_call" => {
-                let custom = item["type"] == "custom_tool_call";
-                let name = tools::alias(string(item, "name")?, optional_namespace(item)?);
+            "function_call" | "custom_tool_call" | "tool_search_call" => {
+                let kind = match item["type"].as_str() {
+                    Some("custom_tool_call") => ToolKind::Custom,
+                    Some("tool_search_call") => ToolKind::Search,
+                    _ => ToolKind::Function,
+                };
+                let name = if kind == ToolKind::Search {
+                    require_client_tool_search(item)?;
+                    TOOL_SEARCH_ALIAS.into()
+                } else {
+                    tools::alias(string(item, "name")?, optional_namespace(item)?)
+                };
                 let call_id = string(item, "call_id")?;
                 if call_id.len() > 512 || call_id.chars().any(char::is_control) {
                     return Err(Error::invalid("Invalid tool call ID"));
                 }
-                let arguments = if custom {
-                    json!({"input": item["input"].as_str().ok_or_else(|| Error::invalid("Custom tool input must be text"))?})
-                } else {
-                    let value: Value =
-                        serde_json::from_str(string(item, "arguments")?).map_err(|_| {
-                            Error::invalid("Function arguments must contain valid JSON")
-                        })?;
-                    if !value.is_object() {
-                        return Err(Error::invalid("Function arguments must be a JSON object"));
+                let arguments = match kind {
+                    ToolKind::Custom => {
+                        json!({"input": item["input"].as_str().ok_or_else(|| Error::invalid("Custom tool input must be text"))?})
                     }
-                    value
+                    ToolKind::Search => item["arguments"].clone(),
+                    ToolKind::Function => serde_json::from_str(string(item, "arguments")?)
+                        .map_err(|_| {
+                            Error::invalid("Function arguments must contain valid JSON")
+                        })?,
                 };
+                if !arguments.is_object() {
+                    return Err(Error::invalid("Tool call arguments must be a JSON object"));
+                }
                 let (parts, id) = if let Some(saved) = replay.get(&format!("call:{call_id}")) {
                     let functions: Vec<_> = saved
                         .iter()
@@ -192,32 +207,49 @@ pub(crate) fn translate(input: Value, model: &str) -> Result<PreparedRequest> {
                     Call {
                         name,
                         id,
-                        custom,
+                        kind,
                         answered: false,
                     },
                 );
                 append(&mut contents, "model", parts);
             }
-            "function_call_output" | "custom_tool_call_output" => {
+            "function_call_output" | "custom_tool_call_output" | "tool_search_output" => {
+                let kind = match item["type"].as_str() {
+                    Some("custom_tool_call_output") => ToolKind::Custom,
+                    Some("tool_search_output") => ToolKind::Search,
+                    _ => ToolKind::Function,
+                };
                 let call_id = string(item, "call_id")?;
                 let call = calls.get_mut(call_id).ok_or_else(|| {
                     Error::invalid(
                         "Tool output requires its preceding call in the full input history",
                     )
                 })?;
-                if call.answered || call.custom != (item["type"] == "custom_tool_call_output") {
+                if call.answered || call.kind != kind {
                     return Err(Error::invalid("Duplicate or mismatched tool output"));
                 }
-                let output = match &item["output"] {
-                    Value::String(output) => output.clone(),
-                    Value::Array(_) => text(&content_parts(&item["output"])?, false)?,
-                    _ => {
+                let output = if kind == ToolKind::Search {
+                    require_client_tool_search(item)?;
+                    if item["status"] != "completed" {
                         return Err(Error::invalid(
-                            "Tool output must be text or text content parts",
+                            "tool_search_output requires status=completed",
                         ));
                     }
+                    tools.load(&item["tools"])?;
+                    json!({"tools":item["tools"]})
+                } else {
+                    let output = match &item["output"] {
+                        Value::String(output) => output.clone(),
+                        Value::Array(_) => text(&content_parts(&item["output"])?, false)?,
+                        _ => {
+                            return Err(Error::invalid(
+                                "Tool output must be text or text content parts",
+                            ));
+                        }
+                    };
+                    json!({"output":output})
                 };
-                let mut response = json!({"name":call.name, "response":{"output":output}});
+                let mut response = json!({"name":call.name, "response":output});
                 if let Some(id) = &call.id {
                     response["id"] = json!(id);
                 }
@@ -238,6 +270,17 @@ pub(crate) fn translate(input: Value, model: &str) -> Result<PreparedRequest> {
     if contents.is_empty() || calls.values().any(|call| !call.answered) {
         return Err(Error::invalid(
             "Conversation needs content and a result for every historical tool call",
+        ));
+    }
+    if omitted_web_search
+        && tools.is_empty()
+        && object.get("tool_choice").and_then(Value::as_str) == Some("required")
+    {
+        return Err(forced_web_search());
+    }
+    if !tools.is_empty() && !boolean(object, "parallel_tool_calls", true)? {
+        return Err(Error::unsupported(
+            "Gemini cannot guarantee parallel_tool_calls=false",
         ));
     }
     let mut body = json!({"contents":contents});
@@ -275,6 +318,40 @@ pub(crate) fn translate(input: Value, model: &str) -> Result<PreparedRequest> {
         tools,
         response_fields,
     })
+}
+
+fn omit_optional_web_search(object: &mut Map<String, Value>) -> Result<bool> {
+    if object
+        .get("tool_choice")
+        .and_then(|choice| choice.get("type"))
+        .and_then(Value::as_str)
+        .is_some_and(tools::is_web_search)
+    {
+        return Err(forced_web_search());
+    }
+    let omitted = object
+        .get_mut("tools")
+        .and_then(Value::as_array_mut)
+        .is_some_and(|entries| {
+            let count = entries.len();
+            entries.retain(|entry| {
+                !entry
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .is_some_and(tools::is_web_search)
+            });
+            entries.len() != count
+        });
+    if omitted && let Some(include) = object.get_mut("include").and_then(Value::as_array_mut) {
+        include.retain(|value| value != "web_search_call.action.sources");
+    }
+    Ok(omitted)
+}
+
+fn forced_web_search() -> Error {
+    Error::unsupported(
+        "tool_choice cannot require web_search/web_search_preview: this Gemini adapter does not execute native web search; only optional declarations are omitted for compatibility",
+    )
 }
 
 fn append(contents: &mut Vec<Value>, role: &str, parts: Vec<Value>) {
@@ -418,12 +495,22 @@ fn validate_options(object: &Map<String, Value>) -> Result<()> {
         "safety_identifier",
         "prompt_cache_key",
         "prompt_cache_retention",
+        "client_metadata",
+        "stream_options",
     ];
-    if object.keys().any(|key| !supported.contains(&key.as_str())) {
-        return Err(Error::unsupported(
-            "The request contains an unsupported Responses option",
-        ));
+    if let Some((key, _)) = object
+        .iter()
+        .find(|(key, value)| !value.is_null() && !supported.contains(&key.as_str()))
+    {
+        return Err(unsupported_option(key));
     }
+    if object
+        .get("client_metadata")
+        .is_some_and(|value| !value.is_null() && !value.is_object())
+    {
+        return Err(Error::invalid("client_metadata must be an object or null"));
+    }
+    validate_stream_options(object)?;
     if let Some(include) = object.get("include").filter(|value| !value.is_null()) {
         let include = include
             .as_array()
@@ -438,6 +525,93 @@ fn validate_options(object: &Map<String, Value>) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn validate_stream_options(object: &Map<String, Value>) -> Result<()> {
+    let Some(options) = object
+        .get("stream_options")
+        .filter(|value| !value.is_null())
+    else {
+        return Ok(());
+    };
+    let options = options
+        .as_object()
+        .ok_or_else(|| Error::invalid("stream_options must be an object or null"))?;
+    if options.values().any(|value| !value.is_null()) && !boolean(object, "stream", false)? {
+        return Err(Error::invalid("stream_options requires stream=true"));
+    }
+    for (key, value) in options.iter().filter(|(_, value)| !value.is_null()) {
+        match key.as_str() {
+            "include_usage" => {
+                if !value.is_boolean() {
+                    return Err(Error::invalid(
+                        "stream_options.include_usage must be a boolean",
+                    ));
+                }
+            }
+            "include_obfuscation" => match value.as_bool() {
+                Some(false) => {}
+                Some(true) => {
+                    return Err(Error::unsupported(
+                        "stream_options.include_obfuscation=true is not implemented by the Gemini adapter",
+                    ));
+                }
+                None => {
+                    return Err(Error::invalid(
+                        "stream_options.include_obfuscation must be a boolean",
+                    ));
+                }
+            },
+            "reasoning_summary_delivery" => {
+                let delivery = value.as_str().ok_or_else(|| {
+                    Error::invalid("stream_options.reasoning_summary_delivery must be text")
+                })?;
+                if delivery != "sequential_cutoff" {
+                    return Err(Error::unsupported(
+                        "Unsupported stream_options.reasoning_summary_delivery",
+                    ));
+                }
+            }
+            _ => {
+                return Err(Error::unsupported(
+                    "Unsupported stream_options field; field names and values are not echoed",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn unsupported_option(key: &str) -> Error {
+    Error::unsupported(match key {
+        "context_management" => {
+            "Responses context_management is not supported; send full input history without server-side compaction"
+        }
+        "access_programs" => "OpenAI access_programs cannot be applied to Gemini",
+        "max_tool_calls" => "Responses max_tool_calls is not supported by the Gemini adapter",
+        "top_logprobs" | "logprobs" => {
+            "Responses logprobs/top_logprobs are not supported by the Gemini adapter"
+        }
+        "max_tokens" | "max_completion_tokens" => {
+            "Use Responses max_output_tokens instead of max_tokens/max_completion_tokens"
+        }
+        "messages" => "Use Responses input instead of Chat Completions messages",
+        "response_format" => "Use Responses text.format instead of response_format",
+        "stream_id" | "generate" => {
+            "WebSocket stream_id/generate controls are not supported by the Gemini adapter"
+        }
+        "extra_body" => "extra_body is an SDK option, not a Responses request field",
+        "prompt" => {
+            "Responses prompt templates are not supported; send instructions and input directly"
+        }
+        "prompt_cache_options" => "OpenAI prompt_cache_options cannot be applied to Gemini",
+        "audio" | "modalities" => {
+            "Responses audio/modalities controls are not supported by this text adapter"
+        }
+        _ => {
+            "The request contains an unsupported non-null Responses option; unrecognized field names and values are not echoed"
+        }
+    })
 }
 
 fn generation_config(object: &Map<String, Value>, model: &str) -> Result<Map<String, Value>> {
@@ -510,10 +684,19 @@ fn generation_config(object: &Map<String, Value>, model: &str) -> Result<Map<Str
                 ));
             }
         }
-        if reasoning
-            .keys()
-            .any(|key| !matches!(key.as_str(), "effort" | "summary"))
-        {
+        if let Some(context) = reasoning.get("context").filter(|value| !value.is_null()) {
+            let context = context
+                .as_str()
+                .ok_or_else(|| Error::invalid("reasoning.context must be text"))?;
+            if context != "auto" {
+                return Err(Error::unsupported(
+                    "Explicit OpenAI reasoning.context selection cannot be applied to Gemini; only auto or an omitted context is supported",
+                ));
+            }
+        }
+        if reasoning.iter().any(|(key, value)| {
+            !value.is_null() && !matches!(key.as_str(), "effort" | "summary" | "context")
+        }) {
             return Err(Error::unsupported("Unsupported reasoning option"));
         }
         if !thinking.is_empty() {
@@ -524,7 +707,7 @@ fn generation_config(object: &Map<String, Value>, model: &str) -> Result<Map<Str
         if !text.is_object() {
             return Err(Error::invalid("text must be an object"));
         }
-        if let Some(format) = text.get("format") {
+        if let Some(format) = text.get("format").filter(|value| !value.is_null()) {
             match format["type"].as_str() {
                 Some("text") => {}
                 Some("json_object") => {

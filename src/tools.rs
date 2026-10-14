@@ -7,12 +7,21 @@ use sha2::{Digest, Sha256};
 
 use crate::error::{Error, Result};
 
-#[derive(Clone)]
+pub(crate) const TOOL_SEARCH_ALIAS: &str = "cpr_tool_search";
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ToolKind {
+    Function,
+    Custom,
+    Search,
+}
+
+#[derive(Clone, PartialEq)]
 pub(crate) struct Tool {
     pub name: String,
     pub namespace: Option<String>,
     pub alias: String,
-    pub custom: bool,
+    pub kind: ToolKind,
     declaration: Value,
 }
 
@@ -46,21 +55,30 @@ impl Tools {
     }
 
     fn add(&mut self, value: &Value, namespace: Option<&str>) -> Result<()> {
-        if self.entries.len() >= 128 {
-            return Err(Error::invalid(
-                "At most 128 function or custom tools are supported",
-            ));
-        }
-        let custom = match value["type"].as_str() {
-            Some("function") => false,
-            Some("custom") => true,
-            _ => {
-                return Err(Error::unsupported(
-                    "Only function, custom and namespace tools are supported; hosted OpenAI tools are not available",
-                ));
+        let kind = match value["type"].as_str() {
+            Some("function") => ToolKind::Function,
+            Some("custom") => ToolKind::Custom,
+            Some("tool_search") => {
+                if namespace.is_some() {
+                    return Err(Error::invalid("tool_search must be a top-level tool"));
+                }
+                require_client_tool_search(value)?;
+                string(value, "description")?;
+                if !value["parameters"].is_object() {
+                    return Err(Error::invalid(
+                        "Client tool_search requires a parameters JSON Schema object",
+                    ));
+                }
+                ToolKind::Search
             }
+            Some(kind) => return Err(unsupported_tool(kind)),
+            None => return Err(Error::invalid("Each tool must have a text type")),
         };
-        let name = string(value, "name")?;
+        let name = if kind == ToolKind::Search {
+            "tool_search"
+        } else {
+            string(value, "name")?
+        };
         if name.len() > 256
             || name.chars().any(char::is_control)
             || namespace.is_some_and(|namespace| {
@@ -69,12 +87,11 @@ impl Tools {
         {
             return Err(Error::invalid("Invalid tool name or namespace"));
         }
-        let alias = alias(name, namespace);
-        if self.entries.iter().any(|entry| entry.alias == alias) {
-            return Err(Error::invalid(
-                "Tool names must be unique within their namespace",
-            ));
-        }
+        let alias = if kind == ToolKind::Search {
+            TOOL_SEARCH_ALIAS.into()
+        } else {
+            alias(name, namespace)
+        };
         let description =
             value
                 .get("description")
@@ -83,7 +100,7 @@ impl Tools {
                     v.as_str()
                         .ok_or_else(|| Error::invalid("Tool description must be text"))
                 })?;
-        let description = if alias == name {
+        let description = if alias == name || kind == ToolKind::Search {
             description.into()
         } else {
             format!(
@@ -93,7 +110,7 @@ impl Tools {
             )
         };
         let mut declaration = json!({"name":alias, "description":description});
-        declaration["parametersJsonSchema"] = if custom {
+        declaration["parametersJsonSchema"] = if kind == ToolKind::Custom {
             let mut input_description =
                 "The complete, unmodified input for this custom tool".to_owned();
             if let Some(format) = value.get("format").filter(|v| !v.is_null()) {
@@ -122,13 +139,40 @@ impl Tools {
             }
             schema
         };
-        self.entries.push(Tool {
-            name: name.into(),
-            namespace: namespace.map(str::to_owned),
-            alias,
-            custom,
-            declaration,
-        });
+        self.insert(
+            Tool {
+                name: name.into(),
+                namespace: namespace.map(str::to_owned),
+                alias,
+                kind,
+                declaration,
+            },
+            false,
+        )
+    }
+
+    fn insert(&mut self, tool: Tool, deduplicate: bool) -> Result<()> {
+        if let Some(existing) = self.get(&tool.alias) {
+            return if deduplicate && existing == &tool {
+                Ok(())
+            } else {
+                Err(Error::invalid("Duplicate or conflicting tool definitions"))
+            };
+        }
+        if self.entries.len() >= 128 {
+            return Err(Error::invalid("At most 128 tools are supported"));
+        }
+        self.entries.push(tool);
+        Ok(())
+    }
+
+    pub fn load(&mut self, input: &Value) -> Result<()> {
+        if !input.is_array() {
+            return Err(Error::invalid("Loaded tools must be an array"));
+        }
+        for tool in Self::parse(Some(input))?.entries {
+            self.insert(tool, true)?;
+        }
         Ok(())
     }
 
@@ -150,14 +194,25 @@ impl Tools {
             Some("required") => ("ANY", None),
             Some(_) => return Err(Error::unsupported("Unsupported tool_choice")),
             None => {
-                if !matches!(value["type"].as_str(), Some("function" | "custom")) {
-                    return Err(Error::unsupported("Unsupported tool_choice selector"));
-                }
-                let name = string(value, "name")?;
+                let kind = match value["type"].as_str() {
+                    Some("function") => ToolKind::Function,
+                    Some("custom") => ToolKind::Custom,
+                    Some("tool_search") => ToolKind::Search,
+                    _ => return Err(Error::unsupported("Unsupported tool_choice selector")),
+                };
                 let namespace = optional_namespace(value)?;
-                let candidate = alias(name, namespace);
-                if self.get(&candidate).is_none() {
-                    return Err(Error::invalid("tool_choice must select a declared tool"));
+                let candidate = if kind == ToolKind::Search {
+                    if namespace.is_some() {
+                        return Err(Error::invalid("tool_search cannot select a namespace"));
+                    }
+                    TOOL_SEARCH_ALIAS.into()
+                } else {
+                    alias(string(value, "name")?, namespace)
+                };
+                if self.get(&candidate).is_none_or(|tool| tool.kind != kind) {
+                    return Err(Error::invalid(
+                        "tool_choice must select a declared tool of the same type",
+                    ));
                 }
                 ("ANY", Some(candidate))
             }
@@ -179,6 +234,56 @@ impl Tools {
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
+}
+
+pub(crate) fn require_client_tool_search(value: &Value) -> Result<()> {
+    if value["execution"] == "client" {
+        Ok(())
+    } else {
+        Err(Error::unsupported(
+            "tool_search requires execution=client; server-executed tool search is not available on Gemini",
+        ))
+    }
+}
+
+pub(crate) fn is_web_search(kind: &str) -> bool {
+    matches!(
+        kind,
+        "web_search"
+            | "web_search_preview"
+            | "web_search_2025_08_26"
+            | "web_search_preview_2025_03_11"
+    )
+}
+
+fn unsupported_tool(kind: &str) -> Error {
+    Error::unsupported(match kind {
+        kind if is_web_search(kind) => {
+            "This Gemini adapter does not execute web_search/web_search_preview; only optional top-level declarations are omitted for compatibility"
+        }
+        "file_search" => {
+            "OpenAI-hosted file_search is not available on Gemini; use a client function or custom tool instead"
+        }
+        "code_interpreter" => {
+            "OpenAI-hosted code_interpreter is not available on Gemini; use a client function or custom tool instead"
+        }
+        "image_generation" => {
+            "OpenAI-hosted image_generation is not available on this Gemini adapter; disable this tool for the route"
+        }
+        "computer" | "computer_use_preview" => {
+            "OpenAI computer/computer_use_preview tools are not supported by this Gemini adapter"
+        }
+        "mcp" => {
+            "OpenAI-hosted mcp is not available on Gemini; expose client-side MCP tools as function or namespace tools instead"
+        }
+        "local_shell" | "shell" => {
+            "Responses local_shell/shell tools are not supported; expose the client shell as a function tool instead"
+        }
+        "namespace" => "Nested namespace tools are not supported",
+        _ => {
+            "Unsupported tool type; use function, custom, namespace or client-executed tool_search; unknown type names and values are not echoed"
+        }
+    })
 }
 
 pub(crate) fn alias(name: &str, namespace: Option<&str>) -> String {

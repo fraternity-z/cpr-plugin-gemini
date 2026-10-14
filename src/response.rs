@@ -14,7 +14,7 @@ use uuid::Uuid;
 use crate::{
     error::{Error, Result},
     replay::{self, ReplayItem},
-    tools::Tools,
+    tools::{ToolKind, Tools},
     usage::Meter,
 };
 
@@ -369,22 +369,26 @@ impl Response {
             .get(alias)
             .cloned()
             .ok_or_else(|| Error::protocol("Gemini called a tool that was not declared"))?;
-        let arguments = function.get("args").cloned().unwrap_or_else(|| json!({}));
-        if !arguments.is_object() {
+        let native_arguments = function.get("args").cloned().unwrap_or_else(|| json!({}));
+        if !native_arguments.is_object() {
             return Err(Error::protocol(
                 "Gemini function arguments must be an object",
             ));
         }
-        let arguments = if tool.custom {
-            if arguments.as_object().is_none_or(|object| object.len() != 1) {
+        let custom = tool.kind == ToolKind::Custom;
+        let arguments = if custom {
+            if native_arguments
+                .as_object()
+                .is_none_or(|object| object.len() != 1)
+            {
                 return Err(Error::protocol("Invalid custom tool arguments"));
             }
-            arguments["input"]
+            native_arguments["input"]
                 .as_str()
                 .ok_or_else(|| Error::protocol("Gemini custom tool input must be text"))?
                 .to_owned()
         } else {
-            serde_json::to_string(&arguments)
+            serde_json::to_string(&native_arguments)
                 .map_err(|_| Error::protocol("Invalid Gemini function arguments"))?
         };
         let call_id = match function.get("id").filter(|value| !value.is_null()) {
@@ -398,31 +402,45 @@ impl Response {
         if !self.call_ids.insert(call_id.clone()) {
             return Err(Error::protocol("Gemini reused a function call ID"));
         }
-        let key = if tool.custom { "input" } else { "arguments" };
-        let mut value = json!({"id":id(if tool.custom { "ct" } else { "fc" }), "type":if tool.custom { "custom_tool_call" } else { "function_call" }, "status":"in_progress", "call_id":call_id, "name":tool.name});
-        value[key] = json!("");
+        let key = if custom { "input" } else { "arguments" };
+        let mut value = if tool.kind == ToolKind::Search {
+            json!({"id":id("tsc"), "type":"tool_search_call", "status":"in_progress", "call_id":call_id, "execution":"client", "arguments":{}})
+        } else {
+            let mut value = json!({"id":id(if custom { "ct" } else { "fc" }), "type":if custom { "custom_tool_call" } else { "function_call" }, "status":"in_progress", "call_id":call_id, "name":tool.name});
+            value[key] = json!("");
+            value
+        };
         if let Some(namespace) = tool.namespace {
             value["namespace"] = json!(namespace);
         }
         let index = self.add_item(value, ContentKind::ToolCall, events)?;
-        self.items[index].value[key] = json!(arguments);
+        self.items[index].value[key] = if tool.kind == ToolKind::Search {
+            native_arguments
+        } else {
+            json!(arguments)
+        };
         self.items[index].parts.push(part.clone());
-        let fields = json!({"item_id":self.items[index].value["id"], "output_index":index, "delta":arguments});
-        self.emit(
-            if tool.custom {
-                "response.custom_tool_call_input.delta"
-            } else {
-                "response.function_call_arguments.delta"
-            },
-            fields,
-            vec![CanonicalEvent::ToolCallDelta {
-                index: index as u32,
-                id: call_id,
-                name: Some(tool.name),
-                arguments,
-            }],
-            events,
-        );
+        let fact = CanonicalEvent::ToolCallDelta {
+            index: index as u32,
+            id: call_id,
+            name: Some(tool.name),
+            arguments: arguments.clone(),
+        };
+        if tool.kind == ToolKind::Search {
+            events.push(ExecutionEvent::canonical(fact));
+        } else {
+            let fields = json!({"item_id":self.items[index].value["id"], "output_index":index, "delta":arguments});
+            self.emit(
+                if custom {
+                    "response.custom_tool_call_input.delta"
+                } else {
+                    "response.function_call_arguments.delta"
+                },
+                fields,
+                vec![fact],
+                events,
+            );
+        }
         Ok(())
     }
 
@@ -547,7 +565,7 @@ impl Response {
                         &mut events,
                     );
                 }
-            } else {
+            } else if value["type"] != "tool_search_call" {
                 let custom = value["type"] == "custom_tool_call";
                 let key = if custom { "input" } else { "arguments" };
                 let mut fields = json!({"item_id":item_id, "output_index":index});

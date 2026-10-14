@@ -3,8 +3,8 @@
   "publisher": "cpr-community",
   "name": "gemini",
   "displayName": "Gemini API",
-  "version": "0.1.0",
-  "description": "通过宿主 URL + Key 账号，将 OpenAI Responses 请求转换为官方或第三方 Gemini 原生协议",
+  "version": "0.1.4",
+  "description": "通过宿主 URL + Key 账号将 OpenAI Responses 转换为官方或第三方 Gemini 原生协议；兼容性忽略可选网页搜索声明，不执行原生联网搜索",
   "license": "Apache-2.0",
   "engines": {
     "codex-proxy-rs": ">=3.26.1, <4.0.0"
